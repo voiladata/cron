@@ -1,8 +1,8 @@
 package cron
 
 import (
+	"container/heap"
 	"context"
-	"sort"
 	"sync"
 	"time"
 )
@@ -11,7 +11,7 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries     []*Entry
+	entries     EntryHeap
 	chain       Chain
 	stop        chan struct{}
 	add         chan *Entry
@@ -114,7 +114,7 @@ func (s byTime) Less(i, j int) bool {
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
 	c := &Cron{
-		entries:     nil,
+		entries:     *new(EntryHeap),
 		chain:       NewChain(),
 		add:         make(chan *Entry),
 		stop:        make(chan struct{}),
@@ -252,11 +252,9 @@ func (c *Cron) run() {
 		entry.Next = entry.Schedule.Next(now)
 		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
 	}
+	heap.Init(&c.entries)
 
 	for {
-		// Determine the next entry to run.
-		sort.Sort(byTime(c.entries))
-
 		var timer *time.Timer
 		if len(c.entries) == 0 || c.entries[0].Next.IsZero() {
 			// If there are no entries yet, just sleep - it still handles new entries
@@ -273,13 +271,12 @@ func (c *Cron) run() {
 				c.logger.Info("wake", "now", now)
 
 				// Run every entry whose next time was less than now
-				for _, e := range c.entries {
-					if e.Next.After(now) || e.Next.IsZero() {
-						break
-					}
+				for topEntry := c.entries.Peek(); !topEntry.Next.After(now) && !topEntry.Next.IsZero(); topEntry = c.entries.Peek() {
+					e := heap.Pop(&c.entries).(*Entry)
 					c.startJob(e.WrappedJob)
 					e.Prev = e.Next
 					e.Next = e.Schedule.Next(now)
+					heap.Push(&c.entries, e)
 					c.logger.Info("run", "now", now, "entry", e.ID, "next", e.Next)
 				}
 
@@ -287,7 +284,7 @@ func (c *Cron) run() {
 				timer.Stop()
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
-				c.entries = append(c.entries, newEntry)
+				heap.Push(&c.entries, newEntry)
 				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
 
 			case replyChan := <-c.snapshot:
@@ -356,11 +353,10 @@ func (c *Cron) entrySnapshot() []Entry {
 }
 
 func (c *Cron) removeEntry(id EntryID) {
-	var entries []*Entry
-	for _, e := range c.entries {
-		if e.ID != id {
-			entries = append(entries, e)
+	for i, e := range c.entries {
+		if e.ID == id {
+			heap.Remove(&c.entries, i)
+			return
 		}
 	}
-	c.entries = entries
 }
